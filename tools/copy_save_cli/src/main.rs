@@ -4,12 +4,13 @@
 //!   inventory   structured inventory export (read-only)
 //!   inspect     header / HMAC / decode stats (read-only)
 //!   roundtrip   no-op body decode→encode + reseal with original nonce
-//!   add-item    clone one existing same-key row into a COPY and patch ids
+//!   add-item    clone a same-key row, or `--donor-key` GUI add-to-bag, onto a COPY
 //!   diff        semantic fingerprint + inventory compare of two copies
 //!
-//! Never writes the input path. Add-item requires an already-present
-//! `ItemKey` so the clone keeps the engine mask of a real row of that
-//! item. This program does **not** guess GoldBar = 53.
+//! Never writes the input path. Same-key clone is preferred. `--donor-key`
+//! is the GUI add-to-bag path (clone a present row, patch `_itemKey`).
+//! Consumable/charge donors (`_coolTimePerCharge` present) are refused.
+//! This program does **not** guess GoldBar = 53.
 
 use crimson_rs::save::{Body, FieldValue, ObjectBlock, Save, ScalarValue};
 use serde_json::{json, Value};
@@ -54,14 +55,18 @@ COMMANDS
   add-item    --save FILE --out-save FILE --out DIR --item-key N
               [--container-key K]   default: first container that already
                                     holds --item-key (prefer Backpack=2)
+              [--donor-key D]       if N is absent: clone a present row of D
+                                    (GUI add-to-bag). Refuses charge/cooltime
+                                    donors. Same-key clone still wins if N is
+                                    already in the save.
   diff        --before FILE --after FILE --out DIR
 
 Always operates on copies. --out-save / --write-copy refuse to equal --save.
 No-args or --help prints this text and exits 2.
 
 GoldBar: this tool never assumes item key 53. Resolve string_key GoldBar
-from a 2.04 iteminfo body (see REPORT) or pass a key that already exists
-in the save so the clone uses that row's mask.
+from a 2.04 iteminfo body, then pass that key. Same-key clone if present;
+otherwise --donor-key of a same-shape backpack row (not beer/water).
 "
 }
 
@@ -240,6 +245,12 @@ struct InvRow {
     is_locked: bool,
     is_new_mark: bool,
     is_new_mark_present: bool,
+    mask_hex: String,
+    has_cool_time: bool,
+}
+
+fn mask_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn collect_inventory(blocks: &[ObjectBlock]) -> Vec<InvRow> {
@@ -283,6 +294,8 @@ fn collect_inventory(blocks: &[ObjectBlock]) -> Vec<InvRow> {
                             is_locked: field_truthy(item, "_isLocked"),
                             is_new_mark: field_truthy(item, "_isNewMark"),
                             is_new_mark_present: field_present(item, "_isNewMark"),
+                            mask_hex: mask_hex(&item.mask_bytes),
+                            has_cool_time: field_present(item, "_coolTimePerCharge"),
                         });
                     }
                 }
@@ -661,7 +674,11 @@ fn cmd_add_item(m: &BTreeMap<String, String>) -> Result<(), String> {
     let item_key: u32 = require(m, "item-key")?
         .parse()
         .map_err(|_| " --item-key must be a decimal u32".to_string())?;
-    let prefer_container: Option<u32> = m.get("container-key").map(|s| s.parse().ok()).flatten();
+    let prefer_container: Option<u32> = m.get("container-key").and_then(|s| s.parse().ok());
+    let donor_key: Option<u32> = m.get("donor-key").and_then(|s| s.parse().ok());
+    if m.contains_key("donor-key") && donor_key.is_none() {
+        return Err(" --donor-key must be a decimal u32".into());
+    }
 
     let file_sha = sha256_file(&save_path)?;
     let mut loaded = load_save(&save_path)?;
@@ -675,7 +692,7 @@ fn cmd_add_item(m: &BTreeMap<String, String>) -> Result<(), String> {
     let before_rows = collect_inventory(&loaded.blocks);
     let (fp_before, fp_n_before, map_before) = fingerprint(&loaded.blocks);
 
-    let loc = find_clone_source(&loaded.blocks, item_key, prefer_container)?;
+    let loc = find_clone_source(&loaded.blocks, item_key, donor_key, prefer_container)?;
     let added = apply_clone_and_patch(&mut loaded.blocks, item_key, loc)?;
 
     let new_body = loaded
@@ -712,6 +729,7 @@ fn cmd_add_item(m: &BTreeMap<String, String>) -> Result<(), String> {
         "copy": out_save.display().to_string(),
         "copy_sha256": sha256_file(&out_save)?,
         "item_key": item_key,
+        "donor_key": donor_key,
         "clone": added,
         "fingerprint_before": { "sha256": fp_before, "entries": fp_n_before },
         "fingerprint_after": { "sha256": fp_after, "entries": fp_n_after },
@@ -746,51 +764,95 @@ fn cmd_add_item(m: &BTreeMap<String, String>) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct CloneLoc {
     block_idx: usize,
     inv_idx: usize,
     item_idx: usize,
     inventory_key: u32,
+    source_item_key: u32,
+    source_mask_hex: String,
+    used_donor: bool,
+}
+
+fn pick_row(matches: &[InvRow], prefer_container: Option<u32>) -> Result<InvRow, String> {
+    if matches.is_empty() {
+        return Err("no clone-source rows".into());
+    }
+    if let Some(ck) = prefer_container {
+        return matches
+            .iter()
+            .find(|r| r.inventory_key == ck)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "clone source not found in container {ck} (have inventory_keys {:?})",
+                    matches
+                        .iter()
+                        .map(|r| r.inventory_key)
+                        .collect::<BTreeSet<_>>()
+                )
+            });
+    }
+    Ok(matches
+        .iter()
+        .find(|r| r.inventory_key == 2)
+        .cloned()
+        .unwrap_or_else(|| matches[0].clone()))
+}
+
+fn loc_from_row(pick: &InvRow, used_donor: bool) -> CloneLoc {
+    CloneLoc {
+        block_idx: pick.block_idx,
+        inv_idx: pick.inv_idx,
+        item_idx: pick.item_idx,
+        inventory_key: pick.inventory_key,
+        source_item_key: pick.item_key,
+        source_mask_hex: pick.mask_hex.clone(),
+        used_donor,
+    }
 }
 
 fn find_clone_source(
     blocks: &[ObjectBlock],
     item_key: u32,
+    donor_key: Option<u32>,
     prefer_container: Option<u32>,
 ) -> Result<CloneLoc, String> {
     let rows = collect_inventory(blocks);
-    let matches: Vec<InvRow> = rows
-        .into_iter()
-        .filter(|r| r.item_key == item_key)
-        .collect();
-    if matches.is_empty() {
+    let same_key: Vec<InvRow> = rows.iter().filter(|r| r.item_key == item_key).cloned().collect();
+    if !same_key.is_empty() {
+        let pick = pick_row(&same_key, prefer_container)?;
+        return Ok(loc_from_row(&pick, false));
+    }
+    let Some(donor_key) = donor_key else {
         return Err(format!(
             "item_key {item_key} is not present in this save. \
-             Refusing to clone a different item (mask mismatch can crash the game). \
-             GoldBar is only safe to add by cloning an existing GoldBar row, or \
-             via the GUI add-item flow with a same-shape currency donor."
+             Refusing to guess a donor. Pass --donor-key D to clone a present \
+             row of D (GUI add-to-bag). Charge/cooltime donors are refused. \
+             Do not retarget beer/water onto a currency or GoldBar row."
+        ));
+    };
+    let donors: Vec<InvRow> = rows
+        .iter()
+        .filter(|r| r.item_key == donor_key)
+        .cloned()
+        .collect();
+    if donors.is_empty() {
+        return Err(format!(
+            "item_key {item_key} is absent and --donor-key {donor_key} is also absent"
         ));
     }
-    let pick: InvRow = if let Some(ck) = prefer_container {
-        matches
-            .iter()
-            .find(|r| r.inventory_key == ck)
-            .cloned()
-            .ok_or_else(|| format!("item_key {item_key} not found in container {ck}"))?
-    } else {
-        matches
-            .iter()
-            .find(|r| r.inventory_key == 2)
-            .cloned()
-            .unwrap_or_else(|| matches[0].clone())
-    };
-    Ok(CloneLoc {
-        block_idx: pick.block_idx,
-        inv_idx: pick.inv_idx,
-        item_idx: pick.item_idx,
-        inventory_key: pick.inventory_key,
-    })
+    let safe: Vec<InvRow> = donors.iter().filter(|r| !r.has_cool_time).cloned().collect();
+    if safe.is_empty() {
+        return Err(format!(
+            "--donor-key {donor_key} only exists as a charge/cooltime row \
+             (_coolTimePerCharge present). Cloning that mask is the historical \
+             beer/water CTD. Pick a backpack row without cooltime."
+        ));
+    }
+    let pick = pick_row(&safe, prefer_container)?;
+    Ok(loc_from_row(&pick, true))
 }
 
 fn apply_clone_and_patch(
@@ -872,6 +934,9 @@ fn apply_clone_and_patch(
             "item_idx": loc.item_idx,
             "inventory_key": loc.inventory_key,
             "inventory_label": inventory_label(loc.inventory_key),
+            "source_item_key": loc.source_item_key,
+            "source_mask_hex": loc.source_mask_hex,
+            "used_donor": loc.used_donor,
         },
         "new_slot_no": new_slot,
         "new_item_no": new_item_no,
@@ -1100,6 +1165,8 @@ mod tests {
         assert_eq!(((beer & 0xFFFF) << 16) | TRANSFERRED_LOW, 0x55F7_0101);
         let report = 1000677u32;
         assert_eq!(((report & 0xFFFF) << 16) | TRANSFERRED_LOW, 0x44E5_0101);
+        // GoldBar ItemKey 53 from 2.04 iteminfo (not assumed by add-item).
+        assert_eq!(((53u32 & 0xFFFF) << 16) | TRANSFERRED_LOW, 0x0035_0101);
     }
 
     #[test]

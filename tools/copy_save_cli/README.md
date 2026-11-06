@@ -15,7 +15,7 @@ It does **not** guess GoldBar = 53. Item names live in `iteminfo`, not in the sa
 | `add-item` | **never** — requires `--out-save` ≠ `--save` | Clone one **already-present** item key onto a copy |
 | `diff` | no | Semantic fingerprint + inventory compare of two copies |
 
-`add-item` will **refuse** if `--item-key` is not already in the save. Cloning a different item's mask into a GoldBar (or any other) key is how the engine CTDs; this CLI will not do it.
+`add-item` prefers a **same-key** clone. If `--item-key` is absent, pass `--donor-key D` to clone a present row of D (the GUI add-to-bag path) and patch identity fields. Charge/cooltime donors (`_coolTimePerCharge` present — beer/water) are refused; that mask is the historical CTD. Same-key still wins when the target key is already in the save.
 
 ## Build (Linux)
 
@@ -37,6 +37,9 @@ cd-copy-save inventory --save slot1/save.save --out /tmp/out-inv
 cd-copy-save roundtrip --save slot1/save.save --out /tmp/out-rt --write-copy /tmp/slot1-roundtrip.save
 cd-copy-save add-item  --save slot1/save.save --out-save /tmp/slot1-plus-one.save \
                        --out /tmp/out-add --item-key <CONFIRMED>
+# if CONFIRMED is absent in the save, GUI add-to-bag from a backpack donor:
+cd-copy-save add-item  --save slot100/save.save --out-save /tmp/slot100-plus-goldbar.save \
+                       --out /tmp/out-add --item-key <CONFIRMED> --donor-key 50001 --container-key 2
 cd-copy-save diff      --before slot1/save.save --after /tmp/slot1-plus-one.save --out /tmp/out-diff
 ```
 
@@ -50,9 +53,9 @@ Committed data in crimson-rs (`data/keys.txt`) is **numeric ItemKey only**.
 1. From a 2.04.xx install, extract `0008` `iteminfo.staticinfobody` (and DLC `iteminfo.dlc_01` if loaded).
 2. Parse with crimson-rs `parse_iteminfo_from_bytes` and select rows whose `string_key` is exactly `GoldBar`.
 3. If that key is **already in the save**, `add-item --item-key <that key>` is the safe clone.
-4. If the save does **not** hold that key, do not retarget some other row. Need a same-mask currency donor (the GUI add-item flow) or a save that already has a GoldBar.
+4. If the save does **not** hold that key, do not silently retarget another row. Use `--donor-key` of a proven same-shape backpack row (not beer/water cooltime mask), or a save that already holds GoldBar.
 
-The old public CE table listing `53 = GoldBar` is **not** used here. This repo pins `2200 = Pyeonjeon_Arrow`; it does not pin GoldBar.
+The old public CE table listing `53 = GoldBar` is **not** hardcoded here. This repo pins `2200 = Pyeonjeon_Arrow`. A 2.04.08 iteminfo body+header pair is what names GoldBar.
 
 ## Crypto / keys
 
