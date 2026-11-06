@@ -43,6 +43,12 @@ print full usage when run with no args.
 | `diff_pamt.py`        | TODO   | Pack-group / file-path diff between two installs                |
 | `diff_save.py`        | TODO   | Diff two save files (same character, before / after edit)       |
 
+### `copy_save_cli/` (Linux binary)
+
+| Tool            | Status | Purpose |
+| --------------- | ------ | ------- |
+| `cd-copy-save`  | DONE   | Offline copy helper: inventory JSON, no-op body roundtrip, optional add-one-item on a COPY. See [`copy_save_cli/README.md`](copy_save_cli/README.md). |
+
 ### `inspect/`
 
 | Tool                   | Status | Purpose                                                          |
