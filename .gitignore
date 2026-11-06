@@ -471,6 +471,7 @@ data/_saves/
 # Rust target/ inside vendor is already covered by vendor/*/ above; keep an
 # explicit rule for any top-level Rust experiments outside vendor.
 /target/
+/tools/copy_save_cli/target/
 
 # IDE / editor cruft beyond the VS template
 .idea/
